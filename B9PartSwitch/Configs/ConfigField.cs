@@ -20,13 +20,11 @@ namespace B9PartSwitch
         public bool destroy = true;
     }
 
-    public class ConfigFieldInfo
+    public abstract class ConfigFieldInfo
     {
         public object Parent { get; private set; }
         public FieldInfo Field { get; private set; }
         public ConfigField Attribute { get; private set; }
-        
-        public ConstructorInfo Constructor { get; protected set; }
 
         public ConfigFieldInfo(object parent, FieldInfo field, ConfigField attribute)
         {
@@ -36,65 +34,16 @@ namespace B9PartSwitch
 
             if (string.IsNullOrEmpty(attribute.configName))
                 Attribute.configName = Field.Name;
-
-            RealType = Type;
-        }
-
-        protected void FindConstructor()
-        {
-            Constructor = null;
-            ConstructorInfo[] constructors = RealType.GetConstructors();
-
-            for (int i = 0; i < constructors.Length; i++)
-            {
-                ParameterInfo[] parameters = constructors[i].GetParameters();
-                if (parameters.Length == 0)
-                {
-                    Constructor = constructors[i];
-                    return;
-                }
-            }
         }
 
         public string Name => Field.Name;
-        public string ConfigName => Attribute.configName;
         public Type Type => Field.FieldType;
+        public virtual Type ElementType => Field.FieldType;
+
+        public string ConfigName => Attribute.configName;
         public bool Copy => Attribute.copy;
-        private Type realType;
-        public Type RealType
-        {
-            get
-            {
-                return realType;
-            }
-            protected set
-            {
-                realType = value;
-
-                // if (Attribute.parseFunction != null && Attribute.parseFunction.Method.GetGenericArguments()[0] != RealType)
-                //     throw new ArgumentException("Parse function on ConfigField attribute of field " + Field.Name + " of class " + Field.DeclaringType.Name + " should have return type " + RealType.Name + " (the same as the field), but instead has return type " + Attribute.parseFunction.Method.GetGenericArguments()[0].Name);
-
-                IsComponentType = RealType.IsSubclassOf(typeof(Component));
-                IsScriptableObjectType = RealType.IsSubclassOf(typeof(ScriptableObject));
-                IsRegisteredParseType = CFGUtil.IsConfigParsableType(RealType);
-                IsParsableType = IsRegisteredParseType; // || Attribute.parseFunction != null;
-                IsFormattableType = IsRegisteredParseType; // || Attribute.formatFunction != null;
-                IsConfigNodeType = IsParsableType ? false : RealType.GetInterfaces().Contains(typeof(IConfigNode));
-                IsSerializableType = RealType.IsUnitySerializableType();
-                if (!IsSerializableType)
-                    Debug.LogWarning("The type " + RealType.Name + " is not a Unity serializable type and thus will not be serialized.  This may lead to unexpected behavior, e.g. the field is null after instantiating a prefab.");
-
-                FindConstructor();
-            }
-        }
-        public bool IsComponentType { get; private set; }
-        public bool IsScriptableObjectType { get; private set; }
-        public bool IsRegisteredParseType { get; private set; }
-        public bool IsParsableType { get; private set; }
-        public bool IsFormattableType { get; private set; }
-        public bool IsConfigNodeType { get; private set; }
-        public bool IsSerializableType { get; private set; }
         public bool IsPersistant => Attribute.persistant;
+
         public object Value
         {
             get
@@ -106,62 +55,207 @@ namespace B9PartSwitch
                 Field.SetValue(Parent, value);
             }
         }
+
+        public virtual void LoadFromNode(ConfigNode node) { }
+        public virtual void SaveToNode(ConfigNode node, bool serializing = false) { }
+
+        public virtual void Destroy() { }
     }
 
-    public class ListFieldInfo : ConfigFieldInfo
+    public abstract class ScalarConfigFieldInfo : ConfigFieldInfo
     {
-        public IList List { get; private set; }
-        public int Count => List.Count;
-        public ConstructorInfo ListConstructor { get; private set; }
+        public ScalarConfigFieldInfo(object parent, FieldInfo field, ConfigField attribute) : base(parent, field, attribute) { }
 
-        public ListFieldInfo(object parent, FieldInfo field, ConfigField attribute)
-            : base(parent, field, attribute)
+        public override void Destroy()
+        {
+            base.Destroy();
+
+            if (Attribute.destroy && Value.IsNotNull() && ElementType.IsSubclassOf(typeof(UnityEngine.Object)))
+                UnityEngine.Object.Destroy((UnityEngine.Object)Value);
+        }
+    }
+
+    public class ValueScalarConfigFieldInfo : ScalarConfigFieldInfo
+    {
+        public ValueScalarConfigFieldInfo(object parent, FieldInfo field, ConfigField attribute) : base(parent, field, attribute) { }
+
+        public override void LoadFromNode(ConfigNode node)
+        {
+            base.LoadFromNode(node);
+
+            var value = node.GetValue(ConfigName);
+
+            if (value.IsNull()) return;
+            
+            Value = CFGUtil.ParseConfigValue(ElementType, value);
+        }
+
+        public override void SaveToNode(ConfigNode node, bool serializing)
+        {
+            base.SaveToNode(node, serializing);
+
+            if (Value.IsNull()) return;
+
+            node.AddValue(ConfigName, CFGUtil.FormatConfigValue(Value)); 
+        }
+    }
+
+    public class NodeScalarConfigFieldInfo : ScalarConfigFieldInfo
+    {
+        public NodeScalarConfigFieldInfo(object parent, FieldInfo field, ConfigField attribute) : base(parent, field, attribute)
+        {
+            if (!ElementType.DerivesFrom(typeof(IConfigNode)))
+                throw new ArgumentException("The type " + ElementType.Name + " does not derive from IConfigNode");
+        }
+
+        public override void LoadFromNode(ConfigNode node)
+        {
+            base.LoadFromNode(node);
+
+            var newNode = node.GetNode(ConfigName);
+
+            if (newNode.IsNull()) return;
+
+            var value = (IConfigNode)Value;
+            CFGUtil.AssignConfigObject(this, newNode, ref value);
+            Value = value;
+        }
+
+        public override void SaveToNode(ConfigNode node, bool serializing)
+        {
+            base.SaveToNode(node, serializing);
+
+            if (Value.IsNull()) return;
+
+            ConfigNode newNode = new ConfigNode(ConfigName);
+            ((IConfigNode)Value).Save(newNode);
+            node.AddNode(newNode);
+        }
+    }
+
+    public abstract class ListConfigFieldInfo : ConfigFieldInfo
+    {
+        private Type elementType;
+
+        public override Type ElementType => elementType;
+
+        public IList List
+        {
+            get
+            {
+                return (IList)Value;
+            }
+            set
+            {
+                Value = value;
+            }
+        }
+
+        public int Count => List.Count;
+
+        public ListConfigFieldInfo(object parent, FieldInfo field, ConfigField attribute) : base(parent, field, attribute)
         {
             if (!Type.IsListType())
                 throw new ArgumentException("The field " + field.Name + " is not a list");
-            List = Field.GetValue(Parent) as IList;
 
-            RealType = Type.GetGenericArguments()[0];
+            elementType = Type.GetGenericArguments()[0];
+        }
 
-            FindConstructor();
+        protected void CreateListIfNecessary()
+        {
+            if (List.IsNotNull()) return;
 
-            ConstructorInfo[] constructors = Type.GetConstructors();
+            // If this is going to throw an exception, let it.  If we cannot create a new instance of a list, then something is seriously fucked.
+            Value = Activator.CreateInstance(Type);
+        }
 
-            for (int i = 0; i < constructors.Length; i++ )
+        protected void ClearList()
+        {
+            DestroyUnityObjects();
+
+            List.Clear();
+        }
+
+        protected void DestroyUnityObjects()
+        {
+            if (Attribute.destroy && ElementType.DerivesFrom(typeof(UnityEngine.Object)))
             {
-                ParameterInfo[] parameters = constructors[i].GetParameters();
-                if (parameters.Length == 0)
+                foreach (var item in List)
                 {
-                    ListConstructor = constructors[i];
-                    break;
+                    if (item.IsNotNull())
+                    {
+                        UnityEngine.Object.Destroy((UnityEngine.Object)item);
+                    }
                 }
             }
+        }
 
-            // if (Attribute.parseFunction == null && IsConfigNodeType && Constructor == null)
-            if (IsConfigNodeType && Constructor == null)
+        public override void Destroy()
+        {
+            DestroyUnityObjects();
+        }
+    }
+
+    public class ValueListConfigFieldInfo : ListConfigFieldInfo
+    {
+        public ValueListConfigFieldInfo(object parent, FieldInfo field, ConfigField attribute) : base(parent, field, attribute) { }
+
+        public override void LoadFromNode(ConfigNode node)
+        {
+            base.LoadFromNode(node);
+
+            var values = node.GetValues(ConfigName);
+
+            if (values.Length == 0) return;
+
+            CreateListIfNecessary();
+
+            bool createNewItems = false;
+            if (Count != values.Length)
             {
-                throw new MissingMethodException("A default constructor is required for the IConfigNode type " + RealType.Name + " (constructor required to parse list field " + field.Name + " in class " + Parent.GetType().Name + ")");
+                ClearList();
+                createNewItems = true;
+            }
+
+            for (int i = 0; i < values.Length; i++)
+            {
+                object obj = null;
+
+                if (!createNewItems)
+                    obj = List[i];
+
+                CFGUtil.AssignConfigObject(this, values[i], ref obj);
+
+                if (createNewItems)
+                    List.Add(obj);
+                else
+                    List[i] = obj; // This may be self-assignment under certain circumstances
             }
         }
 
-        internal void CreateListIfNecessary()
+        public override void SaveToNode(ConfigNode node, bool serializing)
         {
-            if (List == null && ListConstructor != null)
-            {
-                Value = Constructor.Invoke(null);
-                List = Value as IList;
-            }
+            base.SaveToNode(node, serializing);
 
-            if (List == null)
-                throw new ArgumentNullException("Field is null and cannot initialize as new list of type " + Type.Name);
+            foreach (var value in List)
+            {
+                node.AddValue(ConfigName, CFGUtil.FormatConfigValue(value));
+            }
+        }
+    }
+
+    public class NodeListConfigFieldInfo : ListConfigFieldInfo
+    {
+        public NodeListConfigFieldInfo(object parent, FieldInfo field, ConfigField attribute) : base(parent, field, attribute)
+        {
+            if (!ElementType.DerivesFrom(typeof(IConfigNode)))
+                throw new ArgumentException("The type " + ElementType.Name + " does not derive from IConfigNode");
         }
 
-        public void ParseNodes(ConfigNode[] nodes)
+        public override void LoadFromNode(ConfigNode node)
         {
-            if (!IsConfigNodeType)
-                throw new NotImplementedException("The generic type of this list (" + RealType.Name + ") is not an IConfigNode");
-            if (nodes.Length == 0)
-                return;
+            var nodes = node.GetNodes(ConfigName);
+            if (nodes.Length == 0) return;
 
             CreateListIfNecessary();
 
@@ -187,93 +281,20 @@ namespace B9PartSwitch
             }
         }
 
-        public void ParseValues(string[] values)
+        public override void SaveToNode(ConfigNode node, bool serializing)
         {
-            if (!IsParsableType)
-                throw new NotImplementedException("The generic type of this list (" + RealType.Name + ") is not a registered parse type");
-            if (values.Length == 0)
-                return;
+            base.SaveToNode(node, serializing);
 
-            CreateListIfNecessary();
-            bool createNewItems = false;
-            if (Count != values.Length)
+            foreach (var value in List)
             {
-                ClearList();
-                createNewItems = true;
-            }
-
-            for (int i = 0; i < values.Length; i++)
-            {
-                object obj = null;
-
-                if (!createNewItems)
-                    obj = List[i];
-
-                CFGUtil.AssignConfigObject(this, values[i], ref obj);
-
-                if (createNewItems)
-                    List.Add(obj);
+                var newNode = new ConfigNode(ConfigName);
+                if (serializing && value is IConfigNodeSerializable)
+                    (value as IConfigNodeSerializable).SerializeToNode(newNode);
                 else
-                    List[i] = obj; // This may be self-assignment under certain circumstances
+                    (value as IConfigNode).Save(newNode);
+
+                node.AddNode(newNode);
             }
-        }
-
-        public ConfigNode[] FormatNodes(bool serializing = false)
-        {
-            if (!IsConfigNodeType)
-                throw new NotImplementedException("The generic type of this list (" + RealType.Name + ") is not an IConfigNode");
-
-            ConfigNode[] nodes = new ConfigNode[Count];
-
-            for (int i = 0; i < Count; i++)
-            {
-                var node = new ConfigNode();
-                if (serializing && List[i] is IConfigNodeSerializable)
-                    (List[i] as IConfigNodeSerializable).SerializeToNode(node);
-                else
-                    (List[i] as IConfigNode).Save(node);
-                nodes[i] = node;
-            }
-
-            return nodes;
-        }
-
-        public string[] FormatValues()
-        {
-            if (IsConfigNodeType)
-                throw new NotImplementedException("The generic type of this list (" + RealType.Name + ") is an IConfigNode");
-            if (!IsFormattableType)
-                throw new NotImplementedException("The generic type of this list (" + RealType.Name + ") is not a registered parse type");
-
-            string[] values = new string[Count];
-
-            // Func<object, string> formatFunction = Attribute.formatFunction != null ? Attribute.formatFunction : CFGUtil.FormatConfigValue;
-
-            // String s = string.Empty;
-            // CFGUtil.FormatConfigValue(s);
-
-            for (int i = 0; i < Count; i++)
-            {
-                values[i] = CFGUtil.FormatConfigValue(List[i]);
-            }
-
-            return values;
-        }
-
-        public void ClearList()
-        {
-            if ((IsComponentType || IsScriptableObjectType) && Attribute.destroy)
-            {
-                for (int i = 0; i < Count; i++)
-                {
-                    if (List[i] != null)
-                    {
-                        UnityEngine.Object.Destroy(List[i] as UnityEngine.Object);
-                    }
-                }
-            }
-
-            List.Clear();
         }
     }
 }

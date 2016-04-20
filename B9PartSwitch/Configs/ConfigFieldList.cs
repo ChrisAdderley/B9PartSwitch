@@ -19,46 +19,41 @@ namespace B9PartSwitch
         {
             Parent = parent;
             configFields.Clear();
-            FieldInfo[] fields = parent.GetType().GetFields();
-            for (int i = 0; i < fields.Length; i++ )
+
+            foreach (var field in parent.GetType().GetFields())
             {
-                FieldInfo field = fields[i];
-                bool kspField = false;
-                ConfigField configField = null;
-
                 object[] attributes = field.GetCustomAttributes(true);
-                for (int j = 0; j < attributes.Length; j++)
-                {
-                    if (attributes[j] is ConfigField)
-                    {
-                        configField = attributes[j] as ConfigField;
-                    }
-                    else if (attributes[j] is KSPField)
-                    {
-                        kspField = true;
-                    }
-                }
 
-                if (configField != null)
-                {
-                    if (kspField)
-                        throw new NotSupportedException("The property ConfigField is not allowed on a field that also has the KSPField property");
+                var configField = attributes.OfType<ConfigField>().FirstOrDefault();
 
-                    for (int j = 0; j < configFields.Count; j++)
-                    {
-                        if (configFields[j].ConfigName == configField.configName)
-                            throw new NotSupportedException("Two ConfigField properties in the same class cannot have the same name (fields are " + configFields[j].Name + " and " + field.Name + ")");
-                    }
+                if (configField.IsNull())
+                    continue;
 
-                    ConfigFieldInfo fieldInfo;
+                if (attributes.OfType<KSPField>().Any())
+                    throw new NotSupportedException("The property ConfigField is not allowed on a field that also has the KSPField property");
 
-                    if (field.FieldType.IsListType())
-                        fieldInfo = new ListFieldInfo(parent, field, configField);
-                    else
-                        fieldInfo = new ConfigFieldInfo(parent, field, configField);
+                var isList = field.FieldType.IsListType();
+                var elementType = isList ? field.FieldType.GetGenericArguments()[0] : field.FieldType;
+                var isIConfigNode = elementType.DerivesFrom(typeof(IConfigNode));
+                var isParsable = elementType.IsConfigParsableType();
+                
+                ConfigFieldInfo fieldInfo;
 
-                    configFields.Add(fieldInfo);
-                }
+                if (isList && isParsable)
+                    fieldInfo = new ValueListConfigFieldInfo(parent, field, configField);
+                else if (isList && isIConfigNode)
+                    fieldInfo = new NodeListConfigFieldInfo(parent, field, configField);
+                else if (isParsable)
+                    fieldInfo = new ValueScalarConfigFieldInfo(parent, field, configField);
+                else if (isIConfigNode)
+                    fieldInfo = new NodeScalarConfigFieldInfo(parent, field, configField);
+                else
+                    throw new NotImplementedException("Cannot find a suitable way to make the field '" + field.Name + "' on the type " + parent.GetType().Name + " into a ConfigField");
+
+                if (configFields.Any(f => f.ConfigName == fieldInfo.ConfigName))
+                    throw new NotSupportedException("Two ConfigField properties in the same class cannot have the same config name ('" + fieldInfo.ConfigName + "')");
+
+                configFields.Add(fieldInfo);
             }
         }
 
@@ -78,63 +73,18 @@ namespace B9PartSwitch
         {
 
 #if DEBUG
-            Debug.Log("Loading " + Instance.GetType().Name + " from config");
+            Debug.Log("Loading " + Parent.GetType().Name + " from config");
 #endif
-            for (int i = 0; i < configFields.Count; i++)
+            foreach (var field in configFields)
             {
-                ConfigFieldInfo field = configFields[i];
-                if (field is ListFieldInfo)
-                {
-                    ListFieldInfo listInfo = field as ListFieldInfo;
-                    if (listInfo.IsParsableType)
-                    {
-                        listInfo.ParseValues(node.GetValues(field.ConfigName));
-                    }
-                    else if (listInfo.IsConfigNodeType)
-                    {
-                        listInfo.ParseNodes(node.GetNodes(field.ConfigName));
-                    }
-                    else
-                    {
-                        throw new NotImplementedException("Cannot find a suitable way to parse type " + listInfo.RealType.Name + " from a string in a ConfigNode");
-                    }
-                }
-                else
-                {
-                    if (field.IsParsableType)
-                    {
-                        string value = node.GetValue(field.ConfigName);
-                        if (value != null)
-                        {
-                            object result = field.Value;
-
-                            CFGUtil.AssignConfigObject(field, value, ref result);
-                            field.Value = result;
-                        }
-                    }
-                    else if (field.IsConfigNodeType)
-                    {
-                        ConfigNode newNode = node.GetNode(field.ConfigName);
-                        if (newNode != null)
-                        {
-                            IConfigNode result = field.Value as IConfigNode;
-                            CFGUtil.AssignConfigObject(field, newNode, ref result);
-                            field.Value = result;
-                        }
-                    }
-                    else
-                    {
-                        throw new NotImplementedException("Cannot find a suitable way to parse type " + field.Type.Name + " from a string in a ConfigNode");
-                    }
-                }
+                field.LoadFromNode(node);
             }
         }
 
         public void Save(ConfigNode node, bool serializing = false)
         {
-            for (int i = 0; i < configFields.Count; i++)
+            foreach (var field in configFields)
             {
-                ConfigFieldInfo field = configFields[i];
                 if (!field.IsPersistant && !serializing)
                     continue;
 
@@ -142,83 +92,18 @@ namespace B9PartSwitch
                 if (serializing && Parent is Component && !field.Field.GetCustomAttributes(true).Any(a => a is ConfigNodeSerialized))
                     continue;
 
-                if (field.Value.IsNull())
-                    continue;
-
-                if (field is ListFieldInfo)
-                {
-                    ListFieldInfo listInfo = field as ListFieldInfo;
-                    // if (listInfo.Attribute.formatFunction != null || !listInfo.IsConfigNodeType)
-                    if (!listInfo.IsConfigNodeType)
-                    {
-                        if (!listInfo.IsParsableType)
-                            throw new NotImplementedException("No suitable way to format values in list field " + listInfo.Name + " of type " + listInfo.RealType.Name);
-
-                        String[] values = listInfo.FormatValues();
-                        for (int j = 0; j < values.Length; j++)
-                        {
-                            node.SetValue(field.ConfigName, values[j], j, createIfNotFound: true);
-                        }
-                    }
-                    else if (listInfo.IsConfigNodeType)
-                    {
-                        ConfigNode[] nodes = listInfo.FormatNodes(serializing);
-                        for (int j = 0; j < nodes.Length; j++)
-                        {
-                            node.SetNode(field.ConfigName, nodes[j], j, createIfNotFound: true);
-                        }
-                    }
-                    else
-                    {
-                        Debug.LogError("This code should never be reached.  Please report this");
-                    }
-                }
-                else
-                {
-                    // if (field.Attribute.formatFunction != null)
-                    // {
-                    //     string value = field.Attribute.formatFunction(field.Value);
-                    //     node.SetValue(field.ConfigName, value, createIfNotFound: true);
-                    // }
-                    if (field.IsConfigNodeType)
-                    {
-                        ConfigNode newNode = new ConfigNode();
-                        if (serializing && field.Value is IConfigNodeSerializable)
-                            (field.Value as IConfigNodeSerializable).SerializeToNode(newNode);
-                        else
-                            (field.Value as IConfigNode).Save(newNode);
-
-                        node.SetNode(field.ConfigName, newNode, createIfNotFound: true);
-                    }
-                    else if (field.IsRegisteredParseType)
-                    {
-                        string value = CFGUtil.FormatConfigValue(field.Value);
-                        node.SetValue(field.ConfigName, value, createIfNotFound: true);
-                    }
-                    else
-                    {
-                        throw new NotImplementedException("Cannot find a suitable way to save an object of type " + field.RealType.Name + " in a ConfigNode");
-                    }
-                }
+                field.SaveToNode(node, serializing);
             }
         }
 
         public void OnDestroy()
         {
-            for (int i = 0; i < configFields.Count; i++)
+            foreach (var field in configFields)
             {
-                ConfigFieldInfo field = configFields[i];
-
                 if (!field.Attribute.destroy)
                     continue;
 
-                if (field.IsComponentType || field.IsScriptableObjectType)
-                {
-                    if (field is ListFieldInfo)
-                        (field as ListFieldInfo).ClearList();
-                    else
-                        UnityEngine.Object.Destroy(field.Value as UnityEngine.Object);
-                }
+                field.Destroy();
             }
         }
     }
